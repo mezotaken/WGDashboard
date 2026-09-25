@@ -3,8 +3,15 @@
 # Base: Alpine
 #
 
+# AmneziaWG 3.x is required by the 3.0/3.1 parameters. The WGDashboard forks
+# are still on the older 2.x code, which rejects those config keys.
+ARG AWG_GO_VERSION=v3.1.20260828
+ARG AWG_TOOLS_VERSION=v3.1.20260812
+
 # Pull the current golang-alpine image.
 FROM golang:1.26-alpine3.23 AS awg-go
+
+ARG AWG_GO_VERSION
 
 # Install build-dependencies.
 RUN apk add --no-cache \
@@ -14,7 +21,8 @@ RUN apk add --no-cache \
 
 # Standard working directory for WGDashboard
 RUN mkdir -p /workspace && \
-    git clone https://github.com/WGDashboard/amneziawg-go /workspace/awg
+    git clone --depth 1 --branch "${AWG_GO_VERSION}" \
+    https://github.com/amnezia-vpn/amneziawg-go /workspace/awg
 
 # Enable CGO compilation for AmneziaWG
 ENV CGO_ENABLED=1
@@ -32,6 +40,8 @@ RUN go version && \
 #
 FROM alpine:3.23 AS awg-tools
 
+ARG AWG_TOOLS_VERSION
+
 # Install needed dependencies.
 RUN apk add --no-cache \
     make \
@@ -42,12 +52,39 @@ RUN apk add --no-cache \
 
 # Get the workspace ready
 RUN mkdir -p /workspace && \
-    git clone https://github.com/WGDashboard/amneziawg-tools /workspace/awg-tools
+    git clone --depth 1 --branch "${AWG_TOOLS_VERSION}" \
+    https://github.com/amnezia-vpn/amneziawg-tools /workspace/awg-tools
 
 # Change directory
 WORKDIR /workspace/awg-tools/src
 # Compile and change permissions
 RUN make && chmod +x wg*
+
+#
+# FRONTEND BUILDING STAGE
+# Base: Node
+#
+# The frontends are prebuilt and committed under src/static/dist, and Flask
+# serves those files directly. "COPY ./src" would therefore keep the committed
+# assets and ignore changes under src/static/app / src/static/client, so they
+# are rebuilt here instead.
+#
+FROM node:24-alpine3.23 AS frontend-builder
+
+# Keep the original layout, so vite's relative outDir ("../dist/<name>")
+# resolves to /build/src/static/dist/<name>.
+WORKDIR /build/src/static
+
+COPY ./src/static/app/package.json ./src/static/app/package-lock.json ./app/
+RUN cd app && npm ci --no-audit --no-fund
+
+COPY ./src/static/client/package.json ./src/static/client/package-lock.json ./client/
+RUN cd client && npm ci --no-audit --no-fund
+
+COPY ./src/static/app ./app
+COPY ./src/static/client ./client
+RUN cd app && npm run build \
+    && cd ../client && npm run build
 
 #
 # PIP DEPENDENCY BUILDING
@@ -123,6 +160,9 @@ RUN mkdir /data /configs -p ${WGDASH}/src /etc/amnezia/amneziawg \
 
 # Copy the venv and source files from local compiled locations or repos
 COPY ./src ${WGDASH}/src
+# Overwrite the committed prebuilt assets with the freshly built ones.
+COPY --from=frontend-builder /build/src/static/dist/WGDashboardAdmin ${WGDASH}/src/static/dist/WGDashboardAdmin
+COPY --from=frontend-builder /build/src/static/dist/WGDashboardClient ${WGDASH}/src/static/dist/WGDashboardClient
 COPY --from=pip-builder /opt/wgdashboard/src/venv /opt/wgdashboard/src/venv
 COPY ./docker/wg0.conf.template /tmp/wg0.conf.template
 COPY ./docker/wg-dashboard-oidc-providers.json.template /tmp/wg-dashboard-oidc-providers.json.template
